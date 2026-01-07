@@ -52,7 +52,7 @@ struct block {
      * 
      * The block is initialized with data aligned to @c max_align_t, ensuring that any normally-aligned
      * object can be initialized or stored in the block.
-     * 
+     * %
      * @param bytes The size of the block to allocate in bytes.
      */
     explicit block(std::size_t bytes)
