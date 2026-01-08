@@ -136,6 +136,9 @@ namespace cma {
     class arena {
     public:
 
+        /**
+         * @brief Marker used to roll-back some of the memory in the arena.
+         */
         struct marker {
             block* block    {nullptr};
             std::byte* cur  {nullptr};
@@ -167,6 +170,19 @@ namespace cma {
             // Otherwise a new block is needed...
             std::size_t need {0};
             if(impl::overflow_addition(bytes, alignment, need)) { throw std::bad_alloc{}; }
+
+            // Resizing policy dictates that we double our current capacity.
+            std::size_t new_cap {std::max(_active->capacity * 2, need)};
+            new_cap = std::max(new_cap, _block_size);
+
+            auto* b {new block(new_cap)};
+            b->next = nullptr;
+            _active->next = b;
+            _active = b;
+
+            if(void* p {try_alloc_at_active(bytes, alignment)}) { return p; }
+
+            throw std::bad_alloc{}; //This should be virtually impossible...
         }
 
     private:
