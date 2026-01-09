@@ -144,6 +144,10 @@ namespace cma {
             std::byte* cur  {nullptr};
         };
 
+        /**
+         * @brief Explicit ctor for an arena with an initial size per block.
+         * @param initial_block_size The initial size of each memory block in the arena.
+         */
         explicit arena(std::size_t initial_block_size = 64 * 1024)
             : _block_size{std::max<std::size_t>(initial_block_size, 1024)}
             , _head{new block(_block_size)}
@@ -156,6 +160,11 @@ namespace cma {
 
         ~arena() { free_all(); }
 
+        /**
+         * @brief Main function to allocate bytes in a memory arena.
+         * @param bytes The number of bytes to allocate.
+         * @param alignment The alignment of the allocation (default = max_align_t)
+         */
         void* allocate_bytes(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t)) {
             if(bytes == 0) { return nullptr; }
 
@@ -185,11 +194,70 @@ namespace cma {
             throw std::bad_alloc{}; //This should be virtually impossible...
         }
 
+        /**
+         * @brief Creates a marker at the current active block and byte.
+         * @returns The marker at the specified location.
+         */
+        marker create_marker() const noexcept {
+            return marker{_active, _active ? _active->cur : nullptr};
+        }
+
+        /**
+         * @brief Reverts the state of the allocation in the arena to a given marker.
+         * @param m The marker to revert to.
+         * @note This is mainly used to avoid UB with failed/bad allocs.
+         */
+        void rollback_to(const marker& m) noexcept {
+            if (!m.block) { return; }
+
+            _active = m.block;
+            _active->cur = m.cur;
+
+            for(auto* b {_active->next}; b; b = b->next) {
+                b->cur = b->data;
+            }
+        }
+
+        /**
+         * @brief Arena object factory
+         * @tparam T The type to construct in the arena
+         * @tparam Args The constructor arg types to forward
+         * @param args The arguments to forward for construction
+         * @returns The pointer to the object constructed in the arena.
+         */
+        template<typename T, typename... Args>
+        T* make(Args&&... args) {
+            static_assert(!std::is_void_v<T>, "T cannot be void!");
+
+            const marker m {create_marker()};
+            void* memory {allocate_bytes(sizeof(T), alignof(T))};
+
+            try {
+                return ::new (mem) T(std::forward<Args>(args)...);
+            } catch (...) {
+                rollback_to(m);
+                throw;
+            }
+        }
+
+
     private:
+
+        /// @brief The size blocks stored in the arena.
         std::size_t _block_size {0};
+
+        /// @brief The head block of the arena.
         block* _head    {nullptr};
+
+        /// @brief The currently used block in the arena.
         block* _active  {nullptr};
 
+        /**
+         * @brief Releases all held memory back to the OS.
+         * 
+         * The policy for arenas implies that all memory be released together,
+         * avoiding induvidual releases.
+         */
         void free_all() noexcept {
             block* curr {_head};
 
@@ -203,6 +271,12 @@ namespace cma {
             _active = nullptr;
         }
 
+        /**
+         * @brief Attempts to make an allocation at the currently active block in the arena.
+         * @param bytes The number of bytes to allocate.
+         * @param alignment The alignment of the memory.
+         * @returns The address of the allocated memory (raw storage).
+         */
         void* try_alloc_at_active(std::size_t bytes, std::size_t alignment) noexcept {
             std::byte* aligned {impl::align_up(_active->cur, alignment)};
 
