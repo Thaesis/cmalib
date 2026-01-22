@@ -11,6 +11,7 @@
 #include <concepts>
 #include <new>
 #include <algorithm>
+#include <memory_resource>
 
 /**
  * Since this is meant to be exploratory in nature, I will include guarantees and important elements to defining arena allocators.
@@ -140,7 +141,7 @@ namespace cma {
          * @brief Marker used to roll-back some of the memory in the arena.
          */
         struct marker {
-            block* block    {nullptr};
+            block* mem    {nullptr};
             std::byte* cur  {nullptr};
         };
 
@@ -151,7 +152,7 @@ namespace cma {
         explicit arena(std::size_t initial_block_size = 64 * 1024)
             : _block_size{std::max<std::size_t>(initial_block_size, 1024)}
             , _head{new block(_block_size)}
-            , _active{new block(_block_size)}
+            , _active{_head}
         {}
 
         arena(const arena&) = delete;
@@ -169,7 +170,7 @@ namespace cma {
             if(bytes == 0) { return nullptr; }
 
             // If function recieves some over-aligned alignment, we correct to max_align_t
-            if(!impl::is_pow_2(alignment)) {
+            if(alignment == 0 || !impl::is_pow_2(alignment)) {
                 alignment = alignof(std::max_align_t);
             }
 
@@ -208,9 +209,9 @@ namespace cma {
          * @note This is mainly used to avoid UB with failed/bad allocs.
          */
         void rollback_to(const marker& m) noexcept {
-            if (!m.block) { return; }
+            if (!m.mem) { return; }
 
-            _active = m.block;
+            _active = m.mem;
             _active->cur = m.cur;
 
             for(auto* b {_active->next}; b; b = b->next) {
@@ -233,7 +234,7 @@ namespace cma {
             void* memory {allocate_bytes(sizeof(T), alignof(T))};
 
             try {
-                return ::new (mem) T(std::forward<Args>(args)...);
+                return ::new (memory) T(std::forward<Args>(args)...);
             } catch (...) {
                 rollback_to(m);
                 throw;
@@ -287,6 +288,68 @@ namespace cma {
         }
     };
 
+
+    /**
+     * @brief Main adaptor for use with @c std::pmr structures.
+     * This class implements the required functions as specified by cppref.
+     */
+    class cma_resource 
+        : public std::pmr::memory_resource {
+    public:
+            
+        /**
+         * @brief Primary constructor for the memory resource.
+         * @param a The arena that the memory resource will use to manage memory.
+         */
+        explicit cma_resource(arena& a) noexcept
+            : _a{&a} 
+        {}
+
+    private:
+
+        /// @brief The memory arena to be leveraged by the memory resource.
+        arena* _a;
+
+        /**
+         * @brief Allocates raw storage for this @c memory_resource
+         * 
+         * @details
+         * This function overrides @c std::pmr::memory_resource::do_allocate, invoked 
+         * when memory is requested.
+         * 
+         * @param bytes The number of bytes to allocate
+         * @param alignment The alignment of the memory.
+         * @returns A pointer to the allocated raw storage.
+         * @throws std::bad_alloc on failure.
+         */
+        void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+            return _a->allocate_bytes(bytes, alignment);
+        }
+
+        /**
+         * @brief Deallocates raw storage for this @c memory_resource (not currently supported by model)
+         * 
+         * @param p The pointer to the block of raw storage to deallocate.
+         * @param bytes The number of bytes to deallocate
+         * @param alignment The alignment of the memory.
+         */
+        void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {}
+
+        /**
+         * @brief Compares for equality with @p other memory resource.
+         * 
+         * @details
+         * "Two @c memory_resources compare equal if and only if memory allocated from one @c memory_resource
+         *  can be deallocated from the other and vice-versa"
+         * 
+         * @param other The other @c memory_resource to compare.
+         * @returns Whether the @c memory_resources are equal.
+         */
+        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+            return this == &other;
+        }
+
+    };
 }
 
 #endif
