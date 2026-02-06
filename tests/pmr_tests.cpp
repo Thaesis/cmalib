@@ -12,3 +12,13 @@ TEST(cma_arena, make_construct) {
     ASSERT_NE(p, nullptr);
     EXPECT_EQ(*p, 123);
 }
+
+TEST(cma_pmr_adaptor, vector_adaptor) {
+    cma::arena a{};
+    cma::cma_resource r{a};
+    std::pmr::vector<int> v{ &r };
+    v.push_back(1);
+    EXPECT_EQ(v.front(), 1);
+    v.pop_back();
+    EXPECT_EQ(v.empty(), true);
+}

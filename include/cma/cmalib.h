@@ -1,3 +1,19 @@
+/* 
+ * Copyright 2026, Brandon M. Tharp
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #if defined(_MSC_VER) || defined(__clang__) || defined(__GNUC__)
 #   pragma once
 #endif
@@ -12,8 +28,10 @@
 #include <new>
 #include <algorithm>
 #include <memory_resource>
+#include <type_traits>
+#include <memory>
 
-/**
+/*
  * Since this is meant to be exploratory in nature, I will include guarantees and important elements to defining arena allocators.
  * 
  * ...Normally-aligned & Over-alinged objects...
@@ -30,6 +48,120 @@
  */ 
 
 namespace cma {
+
+    namespace mem {
+        
+        /**
+         * @brief Tag representing an IC that utilizes a linear, monotonically addressed range of memory.
+         *
+         * @details
+         * A linearly addressed IC relies on a single address space of a continuous range, [0 . . . capacity_bytes),
+         * with a monotonic address progression. Alloction of `A` then `B` requires that `B`'s starting offset be 
+         * >= `A`'s end offset therein. Additonally, the crossing of an internal boundary (page, row, block) does 
+         * not change the meaning. Wraparound is also forbidden (by the library), such that any given arena must
+         * not rely upon it.
+         */
+        struct layout_linear_t {};
+
+        /**
+         * @brief Tag representing an IC that utilizes multiple independent regions ("banks") wherein every
+         *        address is a pair; [bank + (offset indside the bank)].
+         *
+         * @details
+         * A banked addressed IC relies on many physically or logically devided regions of memory. Offsets
+         * in any given region are not adjacent to offsets in another. Additionally, allocation requires 
+         * a selection of a bank in which to write (implicit or explicit). Address translations require 
+         * more than simply a base and offset.
+         */
+        struct layout_banked_t {};
+
+        /**
+         * @brief Tag representing an IC that can return a pointer (T* / std::byte*) referring directly
+         *        to allocated memory.
+         *
+         * @details
+         * A "direct pointer" IC has memory that is CPU-addressable such that load/store use normal
+         * instructions, devoid of transations. Addresses are stable and will not move once allocated,
+         * where `ptr + n` will always point to the next byte.
+         *
+         * @note Some devices are technically memory-mapped such that direct pointer is "valid". However,
+         * some devices have side effects or special requirements that invalidate this use-case! Word-aligned
+         * writes, read side-effects, and command-sequenced writes break these!
+         */
+        struct direct_ptr_t {};
+
+        /**
+         * @brief Tag representing an IC that does not return a pointer (T* / std::byte*), instead
+         *        relying upon a handle that the device driver uses to access memory.
+         *
+         * @details
+         * A "device handled" IC is more broad in its acceptance and prevailence. A device might 
+         * be device-handled if memory is not in the CPU address space, commands are used to access
+         * memory, pointer dereference is UB, and/or object lifetime cannot be expressed in 
+         * constructors or destructors.
+         */
+        struct device_handle_t {};
+
+        /**
+         * @brief Customization point for all IC trait definitions.
+         */
+        template<typename T>
+        struct ic_traits;
+
+        /**
+         * @brief Concept denoting whether a type has a validly defined set of `ic_traits<T>`.
+         *
+         * @tparam IC The type representing any given memory chip or integrated-circut.
+         *
+         * @details
+         *
+         *
+         */
+        template<typename IC>
+        concept has_ic_traits = requires {
+            { ic_traits<IC>::capacity_bytes } -> std::convertible_to<std::size_t>;
+            { ic_traits<IC>::min_alignment }  -> std::convertible_to<std::size_t>;
+            typename ic_traits<IC>::layout_t;
+            typename ic_traits<IC>::address_t;
+        };
+
+        /**
+         *
+         */
+        template<typename IC>
+        concept ic_spec = 
+            has_ic_traits<IC>
+            && (ic_traits<IC>::capacity_bytes > 0)
+            && (ic_traits<IC>::min_alignment > 0)
+            && (std::is_same_v<typename ic_traits<IC>::layout_t, layout_linear_t> || std::is_same_v<typename ic_traits<IC>::layout_t, layout_banked_t>)
+            && (std::is_same_v<typename ic_traits<IC>::address_t, direct_ptr_t> || std::is_same_v<typename ic_traits<IC>::address_t, device_handle_t>);
+
+        /**
+         *
+         */
+        template<typename IC>
+        concept device_ic =
+            ic_spec<IC>
+            && std::is_same_v<typename ic_traits<IC>::address_t, device_handle_t>
+            && requires {
+                { ic_traits<IC>::read_granularity_bytes } -> std::convertible_to<std::size_t>;
+                { ic_traits<IC>::write_granularity_bytes} -> std::convertible_to<std::size_t>;
+            };
+
+        /**
+         *
+         */
+        template<std::size_t Capacity, std::size_t Align>
+        struct linear_device_base {
+            using layout_t  = layout_linear_t;
+            using address_t = device_handle_t;
+            static constexpr std::size_t capacity_bytes           = Capacity;
+            static constexpr std::size_t min_alignment            = Align;
+            static constexpr std::size_t read_granularity_bytes   = 1;
+            static constexpr std::size_t write_granularity_bytes  = 1;
+        };
+        
+    } // namespace mem
 
     namespace impl {
 
@@ -349,6 +481,52 @@ namespace cma {
             return this == &other;
         }
 
+    };
+
+    template<typename T>
+    class cma_allocator {
+    public:
+        using value_type = T;
+
+        using propagate_on_container_move_assignment = std::true_type;
+        using propagate_on_container_swap            = std::true_type;
+        using propagate_on_container_copy_assignment = std::true_type;
+
+        using is_always_equal = std::false_type;
+
+        cma_allocator() noexcept = default;
+        explicit cma_allocator(arena& a) noexcept : _a{&a} {}
+
+        template<typename U>
+        cma_allocator(const cma_allocator<U>& other) noexcept : _a{other.arena_ptr()} {}
+
+        [[nodiscard]]
+        T* allocate(std::size_t n) {
+            if (!_a) {throw std::bad_alloc{};}
+            if (n == 0) { return nullptr; }
+
+            if (n > max_size()) {
+                throw std::bad_alloc{};
+            }
+
+            const std::size_t bytes{ n * sizeof(T) };
+            void* p = _a->allocate_bytes(bytes, alignof(T));
+            if(!p) { throw std::bad_alloc{}; }
+
+            return static_cast<T*>(p);
+        }
+
+        void deallocate(T*, std::size_t) noexcept {} // no-op for now.
+
+        std::size_t max_size() const noexcept {
+            return std::numeric_limits<std::size_t>::max() / sizeof(T);
+        }
+
+        arena* arena_ptr() const noexcept { return _a; }
+
+    private:
+
+        arena* _a {nullptr};
     };
 }
 
